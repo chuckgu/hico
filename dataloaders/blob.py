@@ -32,6 +32,10 @@ class Blob(object):
         self.gt_classes = []  # [num_gt,2] array of img_ind, class
         self.gt_rels = []  # [num_rels, 3]. Each row is (gtbox0, gtbox1, rel).
 
+        self.gt_boxes_human = []
+        self.gt_human_classes = []
+        self.gt_hoi_classes = []
+
         self.gt_sents = []
         self.gt_nodes = []
         self.sent_lengths = []
@@ -39,7 +43,11 @@ class Blob(object):
         self.train_anchor_labels = []  # [train_anchors, 5] array of (img_ind, h, w, A, labels)
         self.train_anchors = []  # [train_anchors, 8] shapes with anchor, target
 
+        self.train_anchor_labels_human = []  # [train_anchors, 5] array of (img_ind, h, w, A, labels)
+        self.train_anchors_human = []  # [train_anchors, 8] shapes with anchor, target
+
         self.train_anchor_inds = None  # This will be split into GPUs, just (img_ind, h, w, A).
+        self.train_anchor_inds_human = None  # This will be split into GPUs, just (img_ind, h, w, A).
 
         self.batch_size = None
         self.gt_box_chunks = None
@@ -77,11 +85,26 @@ class Blob(object):
         gt_boxes_ = d['gt_boxes'].astype(np.float32) * d['scale']
         self.gt_boxes.append(gt_boxes_)
 
+        gt_boxes_human_ = d['gt_boxes_human'].astype(np.float32) * d['scale']
+        self.gt_boxes_human.append(gt_boxes_human_)
+
         ### 여기서 image ind를 삽입
         self.gt_classes.append(np.column_stack((
             i * np.ones(d['gt_classes'].shape[0], dtype=np.int64),
             d['gt_classes'],
         )))
+
+        self.gt_human_classes.append(np.column_stack((
+            i * np.ones(d['gt_human_classes'].shape[0], dtype=np.int64),
+            d['gt_human_classes'],
+        )))
+
+        self.gt_hoi_classes.append(np.column_stack((
+            i * np.ones(d['gt_hoi_classes'].shape[0], dtype=np.int64),
+            d['gt_hoi_classes'],
+        )))
+
+
 
         # # Add relationship info
         # if self.is_rel:
@@ -100,6 +123,17 @@ class Blob(object):
                 i * np.ones(train_anchor_inds_.shape[0], dtype=np.int64),
                 train_anchor_inds_,
                 train_anchor_labels_,
+            )))
+
+            train_anchors_human_, train_anchor_inds_human_, train_anchor_targets_human_, train_anchor_labels_human_ = \
+                anchor_target_layer(gt_boxes_human_, (h, w))
+
+            self.train_anchors_human.append(np.hstack((train_anchors_human_, train_anchor_targets_human_)))
+
+            self.train_anchor_labels_human.append(np.column_stack((
+                i * np.ones(train_anchor_inds_human_.shape[0], dtype=np.int64),
+                train_anchor_inds_human_,
+                train_anchor_labels_human_,
             )))
 
         # if 'proposals' in d:
@@ -136,13 +170,23 @@ class Blob(object):
 
         self.gt_boxes, self.gt_box_chunks = self._chunkize(self.gt_boxes, tensor=torch.FloatTensor)
         self.gt_classes, _ = self._chunkize(self.gt_classes)
+
+        self.gt_boxes_human, self.gt_box_chunks_human = self._chunkize(self.gt_boxes_human, tensor=torch.FloatTensor)
+        self.gt_human_classes, _ = self._chunkize(self.gt_human_classes)
+
+        # self.gt_hoi_classes, _ = self._chunkize(self.gt_hoi_classes)
+
         if self.is_train:
             self.train_anchor_labels, self.train_chunks = self._chunkize(self.train_anchor_labels)
             self.train_anchors, _ = self._chunkize(self.train_anchors, tensor=torch.FloatTensor)
             self.train_anchor_inds = self.train_anchor_labels[:, :-1].contiguous()
 
-        if len(self.proposals) != 0:
-            self.proposals, self.proposal_chunks = self._chunkize(self.proposals, tensor=torch.FloatTensor)
+            self.train_anchor_labels_human, self.train_chunks_human = self._chunkize(self.train_anchor_labels_human)
+            self.train_anchors_human, _ = self._chunkize(self.train_anchors_human, tensor=torch.FloatTensor)
+            self.train_anchor_inds_human = self.train_anchor_labels_human[:, :-1].contiguous()
+
+        # if len(self.proposals) != 0:
+        #     self.proposals, self.proposal_chunks = self._chunkize(self.proposals, tensor=torch.FloatTensor)
 
 
 
@@ -164,12 +208,25 @@ class Blob(object):
         self.gt_classes = self._scatter(self.gt_classes, self.gt_box_chunks)
         self.gt_boxes = self._scatter(self.gt_boxes, self.gt_box_chunks)
 
+        self.gt_human_classes_primary = self.gt_human_classes.cuda(self.primary_gpu, async=True)
+        self.gt_boxes_human_primary = self.gt_boxes_human.cuda(self.primary_gpu, async=True)
+
+        # Predcls might need these
+        self.gt_human_classes = self._scatter(self.gt_human_classes, self.gt_box_chunks)
+        self.gt_boxes_human = self._scatter(self.gt_boxes_human, self.gt_box_chunks_human)
+
+
         if self.is_train:
 
             self.train_anchor_inds = self._scatter(self.train_anchor_inds,
                                                    self.train_chunks)
             self.train_anchor_labels = self.train_anchor_labels.cuda(self.primary_gpu, async=True)
             self.train_anchors = self.train_anchors.cuda(self.primary_gpu, async=True)
+
+            self.train_anchor_inds_human = self._scatter(self.train_anchor_inds_human,
+                                                   self.train_chunks_human)
+            self.train_anchor_labels_human = self.train_anchor_labels_human.cuda(self.primary_gpu, async=True)
+            self.train_anchors_human = self.train_anchors_human.cuda(self.primary_gpu, async=True)
 
             if self.is_rel:
                 self.gt_rels = self._scatter(self.gt_rels, self.gt_rel_chunks)
@@ -205,27 +262,29 @@ class Blob(object):
             rels = None
             rels_i = None
 
-        if self.proposal_chunks is None:
-            proposals = None
-        else:
-            proposals = self.proposals
+        # if self.proposal_chunks is None:
+        #     proposals = None
+        # else:
+        #     proposals = self.proposals
 
-        if index == 0 and self.num_gpus == 1:
-            image_offset = 0
-            if self.is_train:
-                return (self.imgs, self.im_sizes[0], image_offset,
-                        self.gt_boxes, self.gt_classes, rels, proposals, self.train_anchor_inds)
-            return self.imgs, self.im_sizes[0], image_offset, self.gt_boxes, self.gt_classes, rels, proposals
+        # if index == 0 and self.num_gpus == 1:
+        #     image_offset = 0
+        #     if self.is_train:
+        #         return (self.imgs, self.im_sizes[0], image_offset,
+        #                 self.gt_boxes, self.gt_classes, rels, proposals, self.train_anchor_inds)
+        #     return self.imgs, self.im_sizes[0], image_offset, self.gt_boxes, self.gt_classes, rels, proposals
 
         # Otherwise proposals is None
-        assert proposals is None
+        # assert proposals is None
 
         image_offset = self.batch_size_per_gpu * index
         # TODO: Return a namedtuple
         if self.is_train:
             return (
             self.imgs[index], self.im_sizes[index], image_offset,
-            self.gt_boxes[index], self.gt_classes[index], rels_i, None, self.train_anchor_inds[index])
+            self.gt_boxes[index], self.gt_classes[index], rels_i, None, self.train_anchor_inds[index],
+            self.gt_boxes_human[index], self.gt_human_classes[index],self.train_anchor_inds_human[index])
         return (self.imgs[index], self.im_sizes[index], image_offset,
-                self.gt_boxes[index], self.gt_classes[index], rels_i, None)
+                self.gt_boxes[index], self.gt_classes[index], rels_i, None,
+                self.gt_boxes_human[index], self.gt_human_classes[index],None)
 

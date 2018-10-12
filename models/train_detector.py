@@ -42,7 +42,7 @@ else:
                                                    num_workers=conf.num_workers,
                                                    num_gpus=conf.num_gpus)
 
-detector = ObjectDetector(classes=train.ind_to_classes, num_gpus=conf.num_gpus,
+detector = ObjectDetector(classes=train.ind_to_classes,v_classes=train.ind_to_predicates, num_gpus=conf.num_gpus,
                           mode='rpntrain' if not conf.use_proposals else 'proposals', use_resnet=conf.use_resnet)
 detector.cuda()
 
@@ -112,6 +112,16 @@ def train_batch(b):
     rpn_scores = result.rpn_scores
     rpn_box_deltas = result.rpn_box_deltas
 
+    hm_scores=result.od_human_dists
+    hm_box_deltas=result.od_human_box_deltas
+    hm_bbox_targets=result.od_human_bbox_targets_human
+    hm_roi_boxes = result.od_human_box_priors
+    vb_labels= result.od_verb_labels
+
+
+    rpn_scores_human = result.rpn_scores_human
+    rpn_box_deltas_human = result.rpn_box_deltas_human
+
     # detector loss
     valid_inds = (labels.data != 0).nonzero().squeeze(1)
     fg_cnt = valid_inds.size(0)
@@ -125,10 +135,35 @@ def train_batch(b):
     box_loss = bbox_loss(roi_boxes[valid_inds], box_deltas.view(-1, 4)[twod_inds],
                          bbox_targets[valid_inds]) * box_reg_mult
 
-    loss = class_loss + box_loss
+    ### human loss
+    # detector loss
+    valid_inds = (vb_labels.data != 0).nonzero().squeeze(1)
+    fg_cnt = valid_inds.size(0)
+    bg_cnt = labels.size(0) - fg_cnt
+
+    human_labels=(vb_labels != 0).long()
+    human_class_loss = F.cross_entropy(hm_scores, human_labels)
+
+    # No gather_nd in pytorch so instead convert first 2 dims of tensor to 1d
+    box_reg_mult = 2 * (1. / FG_FRACTION) * fg_cnt / (fg_cnt + bg_cnt + 1e-4)
+    twod_inds = valid_inds * hm_box_deltas.size(1) + human_labels[valid_inds].data
+
+    human_box_loss = bbox_loss(hm_roi_boxes[valid_inds], hm_box_deltas.view(-1, 4)[twod_inds],
+                         hm_bbox_targets[valid_inds]) * box_reg_mult
+
+
+
+    # # verb detector loss
+    # valid_inds_vb = (vb_labels.data != 0).nonzero().squeeze(1)
+    # fg_cnt = valid_inds_vb.size(0)
+    # bg_cnt = labels.size(0) - fg_cnt
+    # vb_class_loss = F.cross_entropy(hm_scores, vb_labels)
+
+    loss = class_loss + box_loss +human_class_loss+human_box_loss
 
     # RPN loss
     if not conf.use_proposals:
+        ### rpn loss
         train_anchor_labels = b.train_anchor_labels[:, -1]
         train_anchors = b.train_anchors[:, :4]
         train_anchor_targets = b.train_anchors[:, 4:]
@@ -140,15 +175,38 @@ def train_batch(b):
         #     fg_cnt, bg_cnt, fg_cnt / (fg_cnt + bg_cnt + 1e-4), FG_FRACTION,
         #     train_valid_inds.size(0), train_anchor_labels.size(0)-train_valid_inds.size(0),
         #     train_valid_inds.size(0) / (train_anchor_labels.size(0) + 1e-4), RPN_FG_FRACTION), flush=True)
+
         rpn_box_mult = 2 * (1. / RPN_FG_FRACTION) * train_valid_inds.size(0) / (train_anchor_labels.size(0) + 1e-4)
         rpn_box_loss = bbox_loss(train_anchors[train_valid_inds],
                                  rpn_box_deltas[train_valid_inds],
                                  train_anchor_targets[train_valid_inds]) * rpn_box_mult
 
-        loss += rpn_class_loss + rpn_box_loss
-        res = pd.Series([rpn_class_loss.data[0], rpn_box_loss.data[0],
-                         class_loss.data[0], box_loss.data[0], loss.data[0]],
-                        ['rpn_class_loss', 'rpn_box_loss', 'class_loss', 'box_loss', 'total'])
+
+        ### human rpn loss
+        train_anchor_labels_human = b.train_anchor_labels_human[:, -1]
+        train_anchors_human = b.train_anchors_human[:, :4]
+        train_anchor_targets_human = b.train_anchors_human[:, 4:]
+
+        train_valid_inds_human = (train_anchor_labels_human.data == 1).nonzero().squeeze(1)
+        human_rpn_class_loss = F.cross_entropy(rpn_scores_human, train_anchor_labels_human)
+
+        # print("{} fg {} bg, ratio of {:.3f} vs {:.3f}. RPN {}fg {}bg ratio of {:.3f} vs {:.3f}".format(
+        #     fg_cnt, bg_cnt, fg_cnt / (fg_cnt + bg_cnt + 1e-4), FG_FRACTION,
+        #     train_valid_inds.size(0), train_anchor_labels.size(0)-train_valid_inds.size(0),
+        #     train_valid_inds.size(0) / (train_anchor_labels.size(0) + 1e-4), RPN_FG_FRACTION), flush=True)
+
+        human_box_mult = 2 * (1. / RPN_FG_FRACTION) * train_valid_inds_human.size(0) / (train_anchor_labels_human.size(0) + 1e-4)
+        human_box_rpn_loss = bbox_loss(train_anchors_human[train_valid_inds_human],
+                                 rpn_box_deltas_human[train_valid_inds_human],
+                                 train_anchor_targets_human[train_valid_inds_human]) * human_box_mult
+
+
+
+
+        loss += rpn_class_loss + rpn_box_loss + human_rpn_class_loss + human_box_rpn_loss
+        res = pd.Series([rpn_class_loss.data[0], rpn_box_loss.data[0],human_rpn_class_loss.data[0], human_box_rpn_loss.data[0],
+                         class_loss.data[0], box_loss.data[0], human_class_loss.data[0], human_box_loss.data[0], loss.data[0]],
+                        ['rpn_class_loss', 'rpn_box_loss', 'human_rpn_class_loss', 'human_box_loss', 'class_loss', 'box_loss', 'human_class_loss', 'human_box_loss', 'total'])
     else:
         res = pd.Series([class_loss.data[0], box_loss.data[0], loss.data[0]],
                         ['class_loss', 'box_loss', 'total'])

@@ -11,8 +11,6 @@ from lib.fpn.box_utils import bbox_preds, center_size, bbox_overlaps
 from lib.fpn.nms.functions.nms import apply_nms
 from lib.fpn.proposal_assignments.proposal_assignments_gtbox import proposal_assignments_gtbox
 from lib.fpn.proposal_assignments.proposal_assignments_det import proposal_assignments_det
-from lib.word_vectors import obj_vectors, verb_vectors
-from lib.fpn.proposal_assignments.rel_assignments import rel_assignments
 
 from lib.fpn.roi_align.functions.roi_align import RoIAlignFunction
 from lib.pytorch_misc import enumerate_by_image, gather_nd, diagonal_inds, Flattener
@@ -30,8 +28,7 @@ class Result(object):
                  od_box_deltas=None, rm_box_deltas=None,
                  od_box_targets=None, rm_box_targets=None, od_box_priors=None, rm_box_priors=None,
                  boxes_assigned=None, boxes_all=None, od_obj_labels=None, rm_obj_labels=None,
-                 rpn_scores=None, rpn_box_deltas=None, rpn_scores_human=None, rpn_box_deltas_human=None, od_human_dists=None,od_human_box_deltas=None,
-                 od_human_bbox_targets_human=None, od_human_box_priors=None, od_verb_labels=None, rel_labels=None,
+                 rpn_scores=None, rpn_box_deltas=None, rel_labels=None,
                  im_inds=None, fmap=None, rel_dists=None, rel_inds=None, rel_rep=None):
         self.__dict__.update(locals())
         del self.__dict__['self']
@@ -57,7 +54,7 @@ class ObjectDetector(nn.Module):
     """
     MODES = ('rpntrain', 'gtbox', 'refinerels', 'proposals')
 
-    def __init__(self, classes,v_classes, mode='rpntrain', num_gpus=1, nms_filter_duplicates=True,
+    def __init__(self, classes, mode='rpntrain', num_gpus=1, nms_filter_duplicates=True,
                  max_per_img=64, use_resnet=False, thresh=0.05):
         """
         :param classes: Object classes
@@ -71,27 +68,12 @@ class ObjectDetector(nn.Module):
         self.mode = mode
 
         self.classes = classes
-        self.v_classes = v_classes
         self.num_gpus = num_gpus
         self.pooling_size = 7
         self.nms_filter_duplicates = nms_filter_duplicates
         self.max_per_img = max_per_img
         self.use_resnet = use_resnet
         self.thresh = thresh
-        self.embed_dim=300
-
-        # EMBEDDINGS
-        embed_vecs = obj_vectors(self.classes, wv_dim=self.embed_dim)
-        self.obj_embed = nn.Embedding(self.num_classes, self.embed_dim)
-        self.obj_embed.weight.data = embed_vecs.clone()
-
-        embed_vecs2 = verb_vectors(self.v_classes, wv_dim=self.embed_dim)
-
-        self.verb_embed = nn.Embedding(len(self.v_classes), self.embed_dim)
-        self.verb_embed.weight.data = embed_vecs2.clone()
-
-        self.obj_embed.requires_grad=False
-        self.verb_embed.requires_grad = False
 
         if not self.use_resnet:
             print("use_vgg!!")
@@ -122,10 +104,6 @@ class ObjectDetector(nn.Module):
         self.score_fc = nn.Linear(output_dim, self.num_classes)
         self.bbox_fc = nn.Linear(output_dim, self.num_classes * 4)
         self.rpn_head = RPNHead(dim=512, input_dim=rpn_input_dim)
-        self.rpn_head_human = RPNHead(dim=512, input_dim=rpn_input_dim)
-
-        self.score_fc_human = nn.Linear(output_dim, 2)
-        self.bbox_fc_human = nn.Linear(output_dim, 2 * 4)
 
     @property
     def num_classes(self):
@@ -161,8 +139,8 @@ class ObjectDetector(nn.Module):
             self.compress(features) if self.use_resnet else features, rois)
         return self.roi_fmap(feature_pool.view(rois.size(0), -1))
 
-    def rpn_boxes(self, fmap, im_sizes, image_offset,rpn_head, embed=None, gt_boxes=None, gt_classes=None, gt_rels=None,
-                  train_anchor_inds=None, mode="obj", proposals=None):
+    def rpn_boxes(self, fmap, im_sizes, image_offset, gt_boxes=None, gt_classes=None, gt_rels=None,
+                  train_anchor_inds=None, proposals=None):
         """
         Gets boxes from the RPN
         :param fmap:
@@ -174,9 +152,8 @@ class ObjectDetector(nn.Module):
         :param train_anchor_inds:
         :return:
         """
-        rpn_feats = rpn_head(fmap)
-
-        rois = rpn_head.roi_proposals(
+        rpn_feats = self.rpn_head(fmap)
+        rois = self.rpn_head.roi_proposals(
             rpn_feats, im_sizes, nms_thresh=0.7,
             pre_nms_topn=12000 if self.training and self.mode == 'rpntrain' else 6000,
             post_nms_topn=2000 if self.training and self.mode == 'rpntrain' else 1000,
@@ -185,7 +162,7 @@ class ObjectDetector(nn.Module):
             if gt_boxes is None or gt_classes is None or train_anchor_inds is None:
                 raise ValueError(
                     "Must supply GT boxes, GT classes, trainanchors when in train mode")
-            rpn_scores, rpn_box_deltas = rpn_head.anchor_preds(rpn_feats, train_anchor_inds,
+            rpn_scores, rpn_box_deltas = self.rpn_head.anchor_preds(rpn_feats, train_anchor_inds,
                                                                     image_offset)
 
             if gt_rels is not None and self.mode == 'rpntrain':
@@ -209,7 +186,7 @@ class ObjectDetector(nn.Module):
                 rel_labels = None
             else:
                 all_rois, labels, bbox_targets = proposal_assignments_det(
-                    rois, gt_boxes.data, gt_classes.data, image_offset, fg_thresh=0.5, mode=mode)
+                    rois, gt_boxes.data, gt_classes.data, image_offset, fg_thresh=0.5)
                 rel_labels = None
 
         else:
@@ -298,7 +275,7 @@ class ObjectDetector(nn.Module):
 
     def forward(self, x, im_sizes, image_offset,
                 gt_boxes=None, gt_classes=None, gt_rels=None, proposals=None, train_anchor_inds=None,
-                gt_boxes_human=None, gt_human_classes=None, train_anchor_inds_human=None, return_fmap=False):
+                return_fmap=False):
         """
         Forward pass for detection
         :param x: Images@[batch_size, 3, IM_SIZE, IM_SIZE]
@@ -316,46 +293,18 @@ class ObjectDetector(nn.Module):
         """
         fmap = self.feature_map(x)
 
-        if self.training:
-            obj_emb=self.obj_embed(gt_classes[:,1])
-            verb_emb=self.verb_embed(gt_human_classes[:,1])
-        else:
-            obj_emb=self.obj_embed.weight[1:]
-            verb_emb=self.verb_embed.weight[1:]
-
-
         # Get boxes from RPN
         rois, obj_labels, bbox_targets, rpn_scores, rpn_box_deltas, rel_labels = \
-            self.get_boxes(fmap, im_sizes, image_offset, self.rpn_head, obj_emb, gt_boxes,
-                           gt_classes, gt_rels, train_anchor_inds, proposals=proposals, mode="obj")
+            self.get_boxes(fmap, im_sizes, image_offset, gt_boxes,
+                           gt_classes, gt_rels, train_anchor_inds, proposals=proposals)
 
-        # Get boxes from RPN_human
-        rois_human, verb_labels, bbox_targets_human, rpn_scores_human, rpn_box_deltas_human, rel_labels = \
-            self.get_boxes(fmap, im_sizes, image_offset, self.rpn_head_human, None, gt_boxes_human,
-                           gt_human_classes, gt_rels, train_anchor_inds_human, proposals=proposals, mode="human")
-
-
-        # Now classify them (obj)
-        obj_fmap = self.obj_feature_map(fmap, rois) ## fmap: 1024*40*40, rois: 2048*5
-
-
-        od_obj_dists = self.score_fc(obj_fmap) ## obj_fmap: 2048*2048
+        # Now classify them
+        obj_fmap = self.obj_feature_map(fmap, rois)
+        od_obj_dists = self.score_fc(obj_fmap)
         od_box_deltas = self.bbox_fc(obj_fmap).view(
             -1, len(self.classes), 4) if self.mode != 'gtbox' else None
 
         od_box_priors = rois[:, 1:]
-
-        ## verb classification
-
-        human_fmap = self.obj_feature_map(fmap, rois_human)  ## fmap: 1024*40*40, rois: 2048*5
-
-        od_human_dists = self.score_fc_human(human_fmap)  ## obj_fmap: 2048*2048
-
-        od_human_box_deltas = self.bbox_fc_human(human_fmap).view(
-            -1, 2, 4) if self.mode != 'gtbox' else None
-
-        od_human_box_priors = rois_human[:, 1:]
-
 
         if (not self.training and not self.mode == 'gtbox') or self.mode in ('proposals', 'refinerels'):
             nms_inds, nms_scores, nms_preds, nms_boxes_assign, nms_boxes, nms_imgs = self.nms_boxes(
@@ -390,14 +339,6 @@ class ObjectDetector(nn.Module):
             box_deltas = od_box_deltas
             obj_dists = od_obj_dists
 
-        # rel_labels = rel_assignments(im_inds.data, box_priors.data, rm_obj_labels.data,
-        #                                     gt_boxes.data, gt_classes.data, gt_rels.data,
-        #                                     image_offset, filter_non_overlap=True,
-        #                                     num_sample_per_gt=1)
-
-
-
-
         return Result(
             od_obj_dists=od_obj_dists,
             rm_obj_dists=obj_dists,
@@ -418,14 +359,7 @@ class ObjectDetector(nn.Module):
             rpn_box_deltas=rpn_box_deltas,
             rel_labels=rel_labels,
             im_inds=im_inds,
-            rpn_scores_human=rpn_scores_human,
-            rpn_box_deltas_human=rpn_box_deltas_human,
-            od_human_dists=od_human_dists,
-            od_human_box_deltas=od_human_box_deltas,
-            od_human_bbox_targets_human=bbox_targets_human,
-            od_human_box_priors=od_human_box_priors,
-            od_verb_labels=verb_labels,
-            fmap=fmap if return_fmap else None
+            fmap=fmap if return_fmap else None,
         )
 
     def nms_boxes(self, obj_dists, rois, box_deltas, im_sizes):
@@ -553,120 +487,6 @@ def filter_det(scores, boxes, start_ind=0, max_per_img=100, thresh=0.001, pre_nm
     return inds_all, scores_all, labels_all
 
 
-class RPNHead_ATT(nn.Module):
-    """
-    Serves as the class + box outputs for each level in the FPN.
-    """
-
-    def __init__(self, dim=512, input_dim=1024):
-        """
-        :param aspect_ratios: Aspect ratios for the anchors. NOTE - this can't be changed now
-               as it depends on other things in the C code...
-        """
-        super(RPNHead_ATT, self).__init__()
-
-        self.anchor_target_dim = 6
-        self.stride = 16
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_dim, dim, kernel_size=3, padding=1),
-            nn.ReLU6(inplace=True),  # Tensorflow docs use Relu6, so let's use it too....
-            nn.Conv2d(dim, self.anchor_target_dim * self._A,
-                      kernel_size=1)
-        )
-
-        ans_np = generate_anchors(base_size=ANCHOR_SIZE,
-                                  feat_stride=self.stride,
-                                  anchor_scales=ANCHOR_SCALES,
-                                  anchor_ratios=ANCHOR_RATIOS,
-                                  )
-        self.register_buffer('anchors', torch.FloatTensor(ans_np))
-
-
-
-    @property
-    def _A(self):
-        return len(ANCHOR_RATIOS) * len(ANCHOR_SCALES)
-
-    def forward(self, fmap, embed=None):
-        """
-        Gets the class / noclass predictions over all the scales
-
-        :param fmap: [batch_size, dim, IM_SIZE/16, IM_SIZE/16] featuremap
-        :return: [batch_size, IM_SIZE/16, IM_SIZE/16, A, 6]
-        """
-        rez = self._reshape_channels(self.conv(fmap))
-        rez = rez.view(rez.size(0), rez.size(1), rez.size(2),
-                       self._A, self.anchor_target_dim)
-        return rez
-
-    def anchor_preds(self, preds, train_anchor_inds, image_offset):
-        """
-        Get predictions for the training indices
-        :param preds: [batch_size, IM_SIZE/16, IM_SIZE/16, A, 6]
-        :param train_anchor_inds: [num_train, 4] indices into the predictions
-        :return: class_preds: [num_train, 2] array of yes/no
-                 box_preds:   [num_train, 4] array of predicted boxes
-        """
-        assert train_anchor_inds.size(1) == 4
-        tai = train_anchor_inds.data.clone()
-        tai[:, 0] -= image_offset
-        train_regions = gather_nd(preds, tai)
-
-        class_preds = train_regions[:, :2]
-        box_preds = train_regions[:, 2:]
-        return class_preds, box_preds
-
-    @staticmethod
-    def _reshape_channels(x):
-        """ [batch_size, channels, h, w] -> [batch_size, h, w, channels] """
-        assert x.dim() == 4
-        batch_size, nc, h, w = x.size()
-
-        x_t = x.view(batch_size, nc, -1).transpose(1, 2).contiguous()
-        x_t = x_t.view(batch_size, h, w, nc)
-        return x_t
-
-    def roi_proposals(self, fmap, im_sizes, nms_thresh=0.7, pre_nms_topn=12000, post_nms_topn=2000):
-        """
-        :param fmap: [batch_size, IM_SIZE/16, IM_SIZE/16, A, 6]
-        :param im_sizes:        [batch_size, 3] numpy array of (h, w, scale)
-        :return: ROIS: shape [a <=post_nms_topn, 5] array of ROIS.
-        """
-        class_fmap = fmap[:, :, :, :, :2].contiguous()
-
-        # GET THE GOOD BOXES AYY LMAO :')
-        class_preds = F.softmax(class_fmap, 4)[..., 1].data.contiguous()
-
-        box_fmap = fmap[:, :, :, :, 2:].data.contiguous()
-
-        anchor_stacked = torch.cat([self.anchors[None]] * fmap.size(0), 0)
-        box_preds = bbox_preds(anchor_stacked.view(-1, 4), box_fmap.view(-1, 4)).view(
-            *box_fmap.size())
-
-        for i, (h, w, scale) in enumerate(im_sizes):
-            # Zero out all the bad boxes h, w, A, 4
-            h_end = int(h) // self.stride
-            w_end = int(w) // self.stride
-            if h_end < class_preds.size(1):
-                class_preds[i, h_end:] = -0.01
-            if w_end < class_preds.size(2):
-                class_preds[i, :, w_end:] = -0.01
-
-            # and clamp the others
-            box_preds[i, :, :, :, 0].clamp_(min=0, max=w - 1)
-            box_preds[i, :, :, :, 1].clamp_(min=0, max=h - 1)
-            box_preds[i, :, :, :, 2].clamp_(min=0, max=w - 1)
-            box_preds[i, :, :, :, 3].clamp_(min=0, max=h - 1)
-
-        sizes = center_size(box_preds.view(-1, 4))
-        class_preds.view(-1)[(sizes[:, 2] < 4) | (sizes[:, 3] < 4)] = -0.01
-        return filter_roi_proposals(box_preds.view(-1, 4), class_preds.view(-1),
-                                    boxes_per_im=np.array([np.prod(box_preds.size()[1:-1])] * fmap.size(0)),
-                                    nms_thresh=nms_thresh,
-                                    pre_nms_topn=pre_nms_topn, post_nms_topn=post_nms_topn)
-
-
 class RPNHead(nn.Module):
     """
     Serves as the class + box outputs for each level in the FPN.
@@ -700,16 +520,16 @@ class RPNHead(nn.Module):
     def _A(self):
         return len(ANCHOR_RATIOS) * len(ANCHOR_SCALES)
 
-    def forward(self, fmap, embed=None):
+    def forward(self, fmap):
         """
         Gets the class / noclass predictions over all the scales
 
         :param fmap: [batch_size, dim, IM_SIZE/16, IM_SIZE/16] featuremap
         :return: [batch_size, IM_SIZE/16, IM_SIZE/16, A, 6]
         """
-        rez = self._reshape_channels(self.conv(fmap)) ## fmap: 40*40*1024
+        rez = self._reshape_channels(self.conv(fmap))
         rez = rez.view(rez.size(0), rez.size(1), rez.size(2),
-                       self._A, self.anchor_target_dim)  ## rez: 40*40*120
+                       self._A, self.anchor_target_dim)
         return rez
 
     def anchor_preds(self, preds, train_anchor_inds, image_offset):

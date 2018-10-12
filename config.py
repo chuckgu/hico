@@ -52,7 +52,7 @@ RPN_FG_FRACTION = 0.5
 FG_FRACTION = 0.25
 # Total number of examples
 RPN_BATCHSIZE = 256
-ROIS_PER_IMG = 256
+ROIS_PER_IMG = 128
 REL_FG_FRACTION = 0.25
 RELS_PER_IMG = 128
 
@@ -154,7 +154,7 @@ class ModelConfig(object):
 
         # Options to deprecate
         parser.add_argument('-coco', dest='coco', help='Use COCO (default to VG)', action='store_true')
-        parser.add_argument('-ckpt', dest='ckpt', help='Filename to load from', type=str, default='checkpoints/hico/vg-9.tar') ##checkpoints/vgdet/vg-24.tar
+        parser.add_argument('-ckpt', dest='ckpt', help='Filename to load from', type=str, default='checkpoints/hico/hico-9.tar') ##checkpoints/vgdet/vg-24.tar
         parser.add_argument('-det_ckpt', dest='det_ckpt', help='Filename to load detection parameters from', type=str, default='')
 
         parser.add_argument('-save_dir', dest='save_dir',
@@ -165,7 +165,7 @@ class ModelConfig(object):
 
         parser.add_argument('-lr', dest='lr', help='learning rate', type=float, default=1e-3)
 
-        parser.add_argument('-b', dest='batch_size', help='batch size per GPU',type=int, default=8)
+        parser.add_argument('-b', dest='batch_size', help='batch size per GPU',type=int, default=6)
         parser.add_argument('-val_size', dest='val_size', help='val size to use (if 0 we wont use val)', type=int, default=5000)
 
         parser.add_argument('-l2', dest='l2', help='weight decay', type=float, default=1e-4)

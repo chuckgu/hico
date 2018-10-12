@@ -11,7 +11,7 @@ from dataloaders.blob import Blob
 from lib.fpn.box_intersections_cpu.bbox import bbox_overlaps
 from config import VG_IMAGES, IM_DATA_FN, VG_SGG_FN, VG_SGG_DICT_FN, BOX_SCALE, IM_SCALE, PROPOSAL_FN, DATA_PATH
 from dataloaders.image_transforms import SquarePad, Grayscale, Brightness, Sharpness, Contrast, \
-    RandomOrder, Hue, random_crop, resize
+    RandomOrder, Hue, random_crop
 from collections import defaultdict
 from pycocotools.coco import COCO
 
@@ -146,6 +146,10 @@ class HICO(Dataset):
         flipped = self.is_train and np.random.random() > 0.5
         gt_boxes = self.gt_boxes[index].copy()
 
+        gt_boxes_human = self.gt_human_boxes[index].copy()
+        gt_human_classes=self.gt_human_classes[index].copy()
+        gt_hoi_classes=self.gt_hoi_classes[index].copy()
+
 
 
         # gt_boxes = gt_boxes * (BOX_SCALE / max(image_unpadded.size))
@@ -199,6 +203,9 @@ class HICO(Dataset):
             'img_size': im_size,
             'gt_boxes': gt_boxes,
             'gt_classes': self.gt_classes[index].copy(),
+            'gt_boxes_human':gt_boxes_human,
+            'gt_human_classes':gt_human_classes,
+            'gt_hoi_classes':gt_hoi_classes,
             # 'gt_relations': gt_rels,
             'scale': img_scale_factor ,  # Multiply the boxes by this.
             'index': index,
